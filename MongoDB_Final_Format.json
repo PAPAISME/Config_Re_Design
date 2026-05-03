@@ -1,0 +1,13 @@
+{
+    "_id": "MM_gen4_cat_v11.5_20260501",
+    "metadata": {
+        "function": "MM",
+        "vg_variant": "gen4_cat",
+        "db_version": "v11.5",
+        "created_at": "2026-05-01T12:00:00Z"
+    },
+    "configs": {
+        "DB2_VG_INFO": {},
+        "DB2_DB2SET_INFO": {}
+    }
+}
