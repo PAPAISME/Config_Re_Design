@@ -1,50 +1,30 @@
 {
     "target_functions": [
-        "SAC",
-        "SM",
-        "RSM",
-        "RPT",
-        "SPC",
-        "SPC1",
-        "SPC2",
-        "MM",
-        "TMM",
-        "TSPC",
-        "TSPC1",
-        "TSPC2",
-        "RC",
-        "SMPSM",
-        "SMINQ",
-        "SMINQA",
-        "SMINQB",
-        "QDEV"
+        "SAC", "SM", "RSM", "RPT", "SPC", "SPC1", "SPC2", 
+        "MM", "TMM", "TSPC", "TSPC1", "TSPC2", "RC", 
+        "SMPSM", "SMINQ", "SMINQA", "SMINQB", "QDEV"
     ],
     "stages": [
         {
             "name": "bootstrap",
             "context_providers": [
-                {
-                    "folder": "DB2_INST_INFO",
-                    "export_keys": [
-                        "inst_name"
-                    ]
-                }
-            ]
+                {"folder": "DB2_INST_INFO", "export_keys": ["inst_name"]}
+            ],
+            "requires": [],
+            "exports": ["inst_name"]
         },
         {
             "name": "database",
             "context_providers": [
-                {
-                    "folder": "DB2_DB_INFO",
-                    "export_keys": [
-                        "db_name"
-                    ]
-                }
-            ]
+                {"folder": "DB2_DB_INFO", "export_keys": ["db_name"]}
+            ],
+            "requires": ["inst_name"],
+            "exports": ["db_name"]
         },
         {
             "name": "final",
-            "render_all": true
+            "render_all": true,
+            "requires": ["inst_name", "db_name"]
         }
     ]
 }
