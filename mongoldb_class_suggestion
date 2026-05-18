@@ -1,0 +1,267 @@
+這完全就是問題的核心真兇（Smoking Gun）！管過 MongoDB 的你，現在看這條線索一定有一種「所有謎團瞬間解開」的通透感。
+
+沒錯，就是因為在每個 Endpoint 裡都寫了 mongoldb_service = MongoDBService(...)，導致每次 API 被呼叫時，程式都會在記憶體裡全新 New 一個 AsyncIOMotorClient。
+
+為什麼這會導致 /get_one_config 死卡 10 秒？
+
+AsyncIOMotorClient 內部會維護一個連線池（預設最大 100 個連線），並且在背景啟動多個執行緒去監測叢集狀態（Topology）。
+
+當你單純跑 /get_all_config 時，你只 New 了一個 Service，開了 100 個連線，用完就沒了。
+
+當你跑 /get_one_config 時，它自己 New 了一個 Service（佔用 100 個連線），接著內部又 await get_metadata_config()，而 Youtube_config() 裡面又 New 了另一個全新的 Service（又佔用 100 個連線）。
+
+在單一執行緒的 FastAPI 併發環境下，這兩個 Client 在極短時間內同時在作業系統（OS）層級瘋狂搶奪本機 Socket、建立 TCP 握手。作業系統或是 MongoDB 端可能一瞬間覺得「這個 IP 怎麼同時發起這麼多併發連線？」，於是把其中一個 Client 的背景選服（Server Selection）封包給丟包（Drop）或延遲（Delay）了。
+
+這一延遲，剛好就觸發了你設定的 serverSelectionTimeoutMS=10s。等 10 秒爆炸後進入第二次 Retry，前面的舊 Client 被垃圾回收（GC）釋放了，新連線才終於戳進去，造成秒回。
+
+別擔心！其實非常好改，完全不需要動到你寫的 find_one 或 insert_many
+
+你寫的 MongoDBService 把基礎 CRUD 封裝起來是非常棒的設計（Repository Pattern），完全不需要重寫！我們只需要改動「這個 Service 物件是何時被建立的」，從 「每次呼叫臨時建立（Transient）」 改成 「全域單例（Singleton）」 即可。
+
+以下我提供兩種在 FastAPI 中最優雅、最推薦的改法：
+
+建議改法 A：最簡單直接的「全域單例法」（3分鐘改完）
+
+不需要動到任何 Class 內部的代碼，只需要在檔案的最外層（全域變數區）把 Service 建立好，然後在 Endpoint 裡直接引用它。
+
+【修改前的 Endpoint 寫法】
+
+Python
+@app.get("/get_one_config")
+async def get_one_config():
+    # 🚨 就是這行每次都 New 導致連線池爆炸
+    mongodb_service = MongoDBService(default_database) 
+    # ... 後續邏輯
+【修改後的寫法】
+
+Python
+# 1. 在 py 檔案的最外層（全域變數），直接初始化唯一的 Service 物件
+# 這樣整台伺服器啟動到關閉，永遠只會建立一個 AsyncIOMotorClient，共用同一個連線池
+db_service = MongoDBService(default_database)
+
+@app.get("/get_basic_metadata")
+async def get_basic_metadata():
+    # 直接使用全域的 db_service
+    cursor = db_service.find_many(...) 
+    return ...
+
+@app.get("/get_one_config")
+async def get_one_config():
+    # 直接使用同一個 db_service
+    metadata = await get_metadata_config() # 裡面也要改成用全域 db_service
+    config_data = await db_service.find_one(...)
+    return ...
+建議改法 B：FastAPI 標準的「Lifespan 生命週期注入法」（更專業、優雅）
+
+如果你希望在 FastAPI 啟動時才連線、關閉時優雅中斷（Disconnect），可以使用 FastAPI 的 lifespan 機制，把 Service 綁在 app.state 上。
+
+Python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. 在 App 啟動時，只建立這一次 Service
+    app.state.db_service = MongoDBService(default_database)
+    yield
+    # 2. 在 App 關閉時，如果 Service 有寫 close() 可以在這裡呼叫
+    # app.state.db_service.mongodb_service.close()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/get_one_config")
+async def get_one_config(request: Request):
+    # 3. 從 request.app.state 中取出這個唯一的 Service
+    mongodb_service = request.app.state.db_service
+    
+    # 這樣呼叫 get_metadata_config 時，記得把這個 mongodb_service 當參數傳進去
+    metadata = await get_metadata_config(mongodb_service)
+    return ...
+這樣改的好處與預期結果
+
+改動極小：你寫的 insert_one、find_many 那些老底子程式碼完全不需要動，你只需要改 Endpoint 裡面獲取 mongodb_service 的那一兩行程式碼。
+
+效能暴增：改完之後，你的 FastAPI 與 MongoDB 之間只會維持穩定的幾條 TCP 連線（配合連線池自動調度）。以前每次建立 Client 需要花費的 10ms~50ms 握手時間直接歸零。
+
+10 秒 Timeout 徹底消失：因為再也沒有「新舊 Client 爭奪連線與處理緒」的問題，Server Selection 會在伺服器啟動時就完成，接下來的每一次路由呼叫，通通都會變成真．毫秒級秒回。
+
+
+================================================================================================================================================================================
+
+但是，當你要把一個自己用的 Class 變成「發行給別人用」的套件時，確實會面臨一個重大的架構挑戰：「如果使用者不知道 Client 是大忌，在程式裡到處 New 你的 MongoDBService，那你的套件不就變成公司內部的 Timeout 製造機了？」
+
+這在軟體工程中，叫做「防呆設計（Idiot-Proof Design）」。好的套件應該要主動限制使用者，確保他們無論怎麼寫，底層都只會維持同一個 AsyncIOMotorClient（連線池）。
+
+以下我為你設計兩種最適合包裝成套件的「防呆架構改法」，你完全不需要重寫基礎的 CRUD（find_one, insert_many 等），只需要調整 __init__ 的宣告方式：
+
+方案一：最推薦的「類別變數單例法（Class-Level Singleton）」
+
+這是寫 Python 套件最優雅的防呆大招。我們利用 Python 的類別變數（Class Variable）來當作全域快取。
+
+當使用者每次呼叫 MongoDBService() 時，你的套件底層會去檢查：「記憶體裡有沒有開過 Client 了？」如果有，就直接沿用，默默把舊的連線池塞給他。
+
+套件內部的改法：
+
+Python
+from motor.motor_asyncio import AsyncIOMotorClient
+
+class MongoDBService:
+    # 🚨 關鍵防呆：定義類別層級的變數（全域共用）
+    _shared_client = None  
+
+    def __init__(self, database_name: str, uri: str = "mongodb://localhost:27017"):
+        # 如果是第一次被 New，才真正建立 Client
+        if MongoDBService._shared_client is None:
+            MongoDBService._shared_client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=10000)
+        
+        # 所有的 instance 最終都共用同一個 _shared_client (連線池)
+        self.mongodb_service = MongoDBService._shared_client
+        self.db = self.mongodb_service[database_name]
+
+    # 你原本寫好的基本 CRUD 完全不用動，繼續用 self.db 或 self.mongodb_service 跑
+    async def find_one(self, collection_name, query_filter):
+        return await self.db[collection_name].find_one(query_filter)
+這樣改對使用者的好處：
+
+其他團隊成員在用你的套件時，他們可以很直覺（但其實很揮霍）地到處 New：
+
+Python
+# 使用者在路由 A 這樣寫
+service_a = MongoDBService("DB2_CONFIG")
+
+# 使用者在路由 B 又 New 了一個
+service_b = MongoDBService("DB2_CONFIG")
+
+# 💡 沒關係！因為防呆機制，service_a 和 service_b 底層對應的是同一個網路連線池！
+# 徹底根治重複 New 導致 10 秒 Timeout 的悲劇。
+方案二：明確解耦的「依賴注入法（Dependency Injection Pattern）」
+
+如果你的套件未來有想要支援「不同的 Microservice 要連到不同的 MongoDB 叢集」的需求，那方案一的強制單例可能會打架。這時我們可以用專業 SDK 常見的作法：逼使用者在初始化時，把 Client 當作參數傳進來。
+
+套件內部的改法：
+
+Python
+class MongoDBService:
+    # 逼使用者必須把外層建好的 client 傳進來
+    def __init__(self, motor_client: AsyncIOMotorClient, database_name: str):
+        self.mongodb_service = motor_client
+        self.db = self.mongodb_service[database_name]
+
+    async def find_one(self, collection_name, query_filter):
+        return await self.db[collection_name].find_one(query_filter)
+使用者端的寫法（例如在 FastAPI 裡）：
+
+Python
+# 1. 使用者在應用程式全域只建一個 client
+app_client = AsyncIOMotorClient("mongodb://...")
+
+# 2. 呼叫你的套件時，把 client 注入進去
+db_service = MongoDBService(motor_client=app_client, database_name="DB2_CONFIG")
+這種設計的暗示意味非常強烈，只要是資深的工程師一看到你的 __init__ 要求傳入 motor_client，他們就會心領神會：「喔！這個套件希望我共用 Client 連線池。」
+
+總結給你的套件開發建議
+
+如果你想讓這個內部套件達到「最無腦、隨插即用、防呆效果最好」的境界，強烈建議直接採用 【方案一：類別變數單例法】。
+
+因為同仁們可能對非同步或 MongoDB 連線池沒那麼敏銳，方案一可以讓他們保持原本習慣的 mongoldb_service = MongoDBService(default_database) 寫法，但底層被你的智慧架構保護得好好的，絕對不會把公司的服務搞到 10 秒 Timeout。
+
+================================================================================================================================================================================
+
+你的直覺非常精準！選擇方案二（依賴注入）確實是一個更有遠見、架構更乾淨的決定。
+
+作為一個要發行給團隊使用的通用套件，「不把環境變數（.env）或特定的連接字串（URI）寫死在套件底層」是軟體設計的重要原則。如果套件自己去讀 env，未來只要團隊有人想連到第二座 MongoDB（例如業務資料庫、Log 資料庫），你的套件就會當場破功。
+
+方案二把 AsyncIOMotorClient 的控制權完全交還給使用者，套件只專注做好「資料庫操作與封裝」，這正是標準 SDK（如 AWS SDK、SQLAlchemy）採用的成熟做法。
+
+為了讓你的 MongoDBService 封裝得更漂亮，並且在使用端（FastAPI）達到完美的防呆與優雅，我為你規劃了一套標準的依賴注入（Dependency Injection）實作範例。
+
+1. 套件端（SDK）的極簡封裝
+
+你的套件內部完全不碰 env，只專注於接收外界給的連線池物件：
+
+Python
+# 這是你發行的套件內容 (例如命名為 db_sdk.py)
+from motor.motor_asyncio import AsyncIOMotorClient
+
+class MongoDBService:
+    def __init__(self, motor_client: AsyncIOMotorClient, database_name: str):
+        """
+        由外部注入已經建立好的 Client，確保連線池生命週期由應用程式自己管理
+        """
+        self.client = motor_client
+        self.db = self.client[database_name]
+
+    # 你原本寫好的 CRUD 照舊，完全不用改
+    async def find_one(self, collection_name: str, query_filter: dict):
+        return await self.db[collection_name].find_one(query_filter)
+        
+    async def find_many(self, collection_name: str, query_filter: dict):
+        # 你的 find_many 邏輯...
+        pass
+2. 使用者端（FastAPI）的最優雅實作
+
+既然使用了方案二，使用者就必須在他們自己的專案中（例如 main.py）去管理 AsyncIOMotorClient 的生命週期。在 FastAPI 中，最標準、最安全的做法是利用 lifespan 加上 Depends。
+
+這套寫法可以確保：無論有多少個 Endpoint、被呼叫多少次，整台伺服器永遠只會New一次 Client，且能完美支援未來連到不同資料庫的需求。
+
+Python
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Depends
+from motor.motor_asyncio import AsyncIOMotorClient
+from db_sdk import MongoDBService  # 引入你的套件
+
+# 1. 定義全域的 client 容器（初始為 None）
+# 使用者自己決定要從哪個環境變數讀取 URI
+_mongo_client: AsyncIOMotorClient = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _mongo_client
+    # 在應用程式啟動時，正式建立唯一的連線池
+    mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+    _mongo_client = AsyncIOMotorClient(mongo_uri, serverSelectionTimeoutMS=10000)
+    yield
+    # 在應用程式關閉時，優雅關閉連線池
+    _mongo_client.close()
+
+app = FastAPI(lifespan=lifespan)
+
+# 2. 建立 FastAPI 的依賴注入函數 (Dependency)
+# 未來如果有別的資料庫，只要換個 database_name 就能秒生出另一個 Service 物件
+def get_config_db_service() -> MongoDBService:
+    return MongoDBService(motor_client=_mongo_client, database_name="DB2_CONFIG")
+
+# 3. 在 Endpoint 中優雅使用
+@app.get("/get_basic_metadata")
+async def get_basic_metadata(db_service: MongoDBService = Depends(get_config_db_service)):
+    # 這裡拿到的 db_service 底層完全共用同一個連線池，絕對不會卡 10 秒！
+    result = await db_service.find_one("METADATA", {})
+    return result
+
+@app.get("/get_one_config")
+async def get_one_config(db_service: MongoDBService = Depends(get_config_db_service)):
+    # 內部呼叫別的 function 時，把 db_service 當成參數傳進去即可
+    metadata = await get_metadata_config(db_service) 
+    return metadata
+為什麼這個設計越看越美？（可擴充性證明）
+
+就像你擔心的：「未來難保不會有其他用途的 MongoDB。」
+
+如果哪天主管走過來跟你說：「我們開了一座新的 MongoDB 叢集，專門用來存使用者的操作 Log（名為 USER_LOGS）。」
+
+你的套件一個字都不用改，使用者只需要在他們自己的 FastAPI 裡多寫幾行 Code 就能完美支援：
+
+Python
+# 輕鬆擴充：定義第二個資料庫的連線（甚至可以是完全不同的 URI）
+_log_mongo_client = AsyncIOMotorClient(os.getenv("LOG_MONGO_URI"))
+
+def get_log_db_service() -> MongoDBService:
+    # 注入另一個 client 和不同的 db_name
+    return MongoDBService(motor_client=_log_log_mongo_client, database_name="USER_LOGS")
+
+# 在 Endpoint 中看你想用哪一座，就 Depends 哪一個，乾淨俐落！
+@app.get("/get_logs")
+async def get_logs(log_service: MongoDBService = Depends(get_log_db_service)):
+    return await log_service.find_many("app_logs", {})
+選擇方案二，代表你跳脫了「只解決當下專案問題」的層次，真正站在軟體產品（SDK）的維度去思考開放性（Open-Closed Principle）。這絕對是一個更有說服力、更能通過 Code Review 的好設計。
